@@ -126,6 +126,7 @@ impl Default for MessageBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::MessageId;
     use crate::payload::Payload;
     use crate::trit::Trit;
 
