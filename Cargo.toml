@@ -1,0 +1,11 @@
+[package]
+name = "ternary-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Wire protocol for communication between ternary agents — message passing, serialization, and synchronization"
+license = "MIT"
+repository = "https://github.com/SuperInstance/ternary-protocol"
+keywords = ["ternary", "protocol", "agent", "messaging"]
+categories = ["network-programming", "encoding"]
+
+[dev-dependencies]
