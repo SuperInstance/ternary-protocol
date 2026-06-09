@@ -1,117 +1,139 @@
 # ternary-protocol
 
-**Wire protocol for communication between ternary agents — serialization, routing, synchronization, and capability negotiation.**
+Wire protocol for communication between ternary agents — message passing, serialization, and synchronization.
 
-## Background
+Pure Rust, no unsafe, no external dependencies.
 
-Every distributed system needs a wire protocol — a shared language for encoding, transporting, and decoding messages between nodes. Protocols like HTTP, gRPC (Protocol Buffers), and MQTT define how data is serialized, how messages are routed, and how connections are established. The SuperInstance ecosystem uses **balanced ternary** (−1, 0, +1) as its fundamental data representation, requiring a purpose-built protocol that operates on trits rather than bits.
+---
 
-`ternary-protocol` defines the complete wire format for inter-agent communication: trit encoding, ternary payloads, structured messages, message bus routing, state synchronization via diffs, capability-based handshakes, and version negotiation. Pure Rust, no unsafe code, no external dependencies.
+## Why This Exists
 
-## How It Works
+If agents are going to coordinate — pass tasks, share state, negotiate — they need a language. Not human language (that's what A2A is for), but a *wire language*. A way for one agent to say "here's my state vector" to another agent in a format both can parse without an LLM in the middle.
 
-### Trit Encoding (`trit.rs`)
+This protocol encodes everything as sequences of **trits** (ternary digits: -1, 0, +1). Why ternary? Because the agents in the SuperInstance ecosystem speak ternary natively. Their state, their relationships, their strategies — all expressed as {-1, 0, +1} vectors. Encoding the wire protocol in the same formalism means no translation layer between "what the agent thinks" and "what goes on the wire."
 
-The atomic unit is a `Trit`: `Neg` (−1), `Zero` (0), or `Pos` (+1). Two trits pack into a single byte using nibble encoding — upper nibble for the first trit, lower nibble for the second. This gives a 50% density improvement over naive one-trit-per-byte encoding, though it remains less dense than binary (log₂3 ≈ 1.585 bits per trit).
+The protocol is the *nervous system* of the ternary agent fleet. Agents don't send paragraphs. They send structured trit sequences that another agent can route, sync, and verify without needing to *understand* the content — just the structure.
 
-### Payload Serialization (`payload.rs`)
+---
 
-`Payload` is a sequence of trits with compact binary serialization:
+> ⛏️ **DEEP CUT: Trit Encoding Is Not About Compression**
+> 
+> Packing two trits per byte (4+4 nibble scheme) looks like an optimization. It's not. The real reason is **alignment**: when every message is a sequence of trits, and every trit is the same size on the wire, the routing layer doesn't need to care about message content. It can forward, batch, and synchronize purely on structure.
+> 
+> The 4+4 nibble scheme is also carefully chosen so that trit boundaries are always byte-aligned for odd-length sequences (the padding trit goes in the lower nibble of the last byte). This means a receiver can always find the next message boundary by looking at the byte count — no variable-length decoding needed.
+> 
+> The cost is wasted bits (4 bits per trit, but only 2 bits are needed for {-1,0,+1}). That's 50% overhead. It's worth it because the routing layer stays stupid-simple. Solid-state physics trits (spin states, charge states, flux quanta) also naturally map to the {-1,0,+1} encoding with zero translation.
+> 
+> In other words: the protocol wastes bytes to save CPU cycles, which is the correct trade for an agent fleet where CPU is scarce and bandwidth is abundant. The opposite of the internet's tradeoff, and intentionally so.
 
+---
+
+## Protocol Specification
+
+### Overview
+
+This crate defines the wire protocol used by ternary agents to communicate. All data is encoded as sequences of **trits** (ternary digits: -1, 0, +1), serialized in a compact binary format.
+
+### Trit Encoding
+
+A **trit** is a ternary digit with three possible values:
+
+| Value | Name     | Meaning   |
+|-------|----------|-----------|
+| -1    | `Neg`    | Negative  |
+| 0     | `Zero`   | Zero      |
+| +1    | `Pos`    | Positive  |
+
+**Wire encoding**: Two trits are packed into a single byte using a 4+4 nibble scheme:
+- Upper nibble = `trit_value + 1` (maps -1→0, 0→1, 1→2)
+- Lower nibble = `trit_value + 1`
+
+### Payload
+
+A `Payload` is a variable-length sequence of trits.
+
+**Wire format**:
 ```
-[4 bytes: trit count (big-endian)] [packed trit pairs]
+[4 bytes: trit count (u32 BE)] [packed trit pairs...]
 ```
 
-Odd-length payloads pad the final byte with `Zero`. This format is self-delimiting — the length prefix enables parsing without external framing.
+If the trit count is odd, the last byte contains a padding trit (Zero) in the lower nibble.
 
-### Messages (`message.rs`)
+### TernaryMessage
 
-`TernaryMessage` is a structured envelope:
+A structured message between agents.
 
+**Wire format**:
 ```
-[8B id] [8B sender] [8B receiver] [8B timestamp] [payload bytes]
+[8 bytes: message ID (u64 BE)]
+[8 bytes: sender agent ID (u64 BE)]
+[8 bytes: receiver agent ID (u64 BE)]  (0 = broadcast)
+[8 bytes: timestamp (u64 BE)]
+[...payload bytes]
 ```
 
-Receiver `0` denotes broadcast. Messages are `Eq + Hash` for deduplication and `Clone` for fan-out. `MessageId` provides a monotonic generator for sequential IDs.
+### Message Routing (MessageBus)
 
-### Message Bus (`bus.rs`)
+Three routing modes:
 
-`MessageBus` is an in-process routing layer with three modes:
+- **Unicast**: Direct message to a specific agent (receiver = agent ID)
+- **Broadcast**: Message to all registered agents (receiver = 0)
+- **Multicast**: Message to a group of agents (receiver = group ID)
 
-- **Unicast** — deliver to a specific agent
-- **Multicast** — deliver to a group (topic-like)
-- **Broadcast** — deliver to all registered agents
+### Sync Protocol
 
-Agents register with `register(id)`, join multicast groups with `join_group(group, agent)`, and receive messages via per-agent inboxes. Errors (`AgentNotFound`, `NoSubscribers`, `QueueFull`) surface routing failures.
+Synchronization handles agent join/leave, state reconciliation, and clock drift.
 
-### State Synchronization (`sync.rs`)
+**Agent Registration Message** (sent on join):
+```
+[8 bytes: agent ID (u64 BE)]
+[2 bytes: listening port (u16 BE)]
+[4 bytes: protocol version (u32 BE)]
+```
 
-`SyncProtocol` computes diffs between `Payload` instances, producing `DiffOp` sequences:
+**State Sync Request**:
+```
+[8 bytes: requesting agent ID (u64 BE)]
+[8 bytes: last known state timestamp (u64 BE)]
+[2 bytes: max payload size (u16 BE)]
+```
 
-- **Insert** — add trits at a position
-- **Remove** — delete trits at a position
-- **Replace** — overwrite trits at a position
+**State Sync Response**:
+```
+[8 bytes: responding agent ID (u64 BE)]
+[8 bytes: current state timestamp (u64 BE)]
+[2 bytes: flags (u16 BE)] — bit 0: more data, bit 1: error
+[...state payload bytes]
+```
 
-Diffs serialize to a compact binary format and can be applied to reconstruct the target payload. This enables incremental state sync — similar to rsync's delta-transfer algorithm but for ternary data.
+<<<<<<< HEAD
+**Heartbeat** (periodic, no response expected):
+```
+[4 bytes: agent ID (u32 BE)]
+[4 bytes: uptime seconds (u32 BE)]
+```
 
-### Handshake (`handshake.rs`)
+## Design Decisions
 
-Before communicating, agents perform a capability handshake:
+1. **No LLM in the hot path** — trit parsing is bit-twiddling, not inference. The protocol is designed so that a simple C or Rust receiver can parse and route messages without *any* AI component.
 
-1. **Hello** — exchange agent IDs, capabilities (name + version), and protocol version ranges
-2. **Negotiation** — intersect capabilities, select the highest compatible protocol version
-3. **Completion** — both agents have a shared set of negotiated capabilities
+2. **Fixed-size headers** — every message header is exactly 32 bytes (4× u64). This means a receiver can always find the header boundary regardless of payload size.
 
-Handshake states: `Idle → HelloSent → Completed` (or `Rejected`). Errors include `VersionMismatch` and `NoCommonCapabilities`.
+3. **Big-endian wire format** — network byte order for compatibility across architectures. The performance cost on little-endian machines is negligible at agent-scale message rates.
 
-### Version Negotiation (`version.rs`)
+4. **Zero = broadcast** — reusing the reserved receiver ID 0 as a broadcast signal eliminates the need for a separate broadcast header or routing table check.
 
-`ProtocolVersion` follows semver: `major.minor.patch`. Compatibility is defined as same major version. The `negotiate()` method selects the highest compatible version from a set of peer versions.
+5. **No encryption in-band** — the protocol assumes a transport layer handles encryption (TLS, Noise, or physical isolation). The protocol itself is plaintext for simplicity and debuggability.
 
-## Experimental Results
+License: MIT
+=======
+MIT
 
-Each module has dedicated tests validating:
+## See Also
+- **ternary-channel** — related
+- **ternary-bus** — related
+- **ternary-beacon** — related
+- **ternary-handshake** — related
+- **ternary-room** — related
 
-- **Trit encoding** — `from_i8` roundtrips, invalid values rejected, pack/unpack symmetry
-- **Payload serialization** — empty, single-trit, multi-trit, odd-length padding
-- **Message wire format** — unicast and broadcast construction, byte serialization
-- **Bus routing** — unicast delivery, multicast fan-out, broadcast, error cases
-- **Diff computation** — insert, remove, replace operations, apply correctness
-- **Handshake** — successful negotiation, version mismatch rejection, no-common-capabilities
-- **Version** — compatibility checks, negotiation across multiple peer versions
-
-## Impact
-
-`ternary-protocol` is the lingua franca of the SuperInstance ecosystem. Every other crate either produces or consumes protocol messages. The design choices — ternary-native encoding, capability negotiation, diff-based sync — reflect the ecosystem's core thesis that balanced ternary enables richer semantics than binary.
-
-The diff-based synchronization is particularly relevant for fleet management: when rooms diverge, only the delta needs to be transmitted, reducing bandwidth usage and enabling fast convergence. This mirrors how version control systems (Git, Mercurial) synchronize state, but adapted for ternary data structures.
-
-## Use Cases
-
-1. **Inter-node fleet communication** — Rooms exchange `TernaryMessage` instances over TCP, using the wire format for serialization and the bus for routing. Handshakes ensure capability compatibility before data exchange.
-
-2. **State replication** — Rooms synchronize shared state using `SyncProtocol` diffs. When a room reconnects after a network partition, it requests a diff from the current state rather than a full snapshot, minimizing transfer size.
-
-3. **Version-aware agent networks** — Agents running different protocol versions negotiate the highest compatible version during handshake, enabling rolling upgrades without fleet-wide downtime.
-
-4. **Multicast event distribution** — The message bus's multicast groups enable topic-based event routing: agents subscribe to relevant groups and receive only matching messages, similar to MQTT topics.
-
-5. **Ternary data interchange** — Systems that natively operate on trits (ternary processors, ternary neural networks) can use the payload format directly without binary ↔ ternary conversion overhead.
-
-## Open Questions
-
-- **Encryption and authentication:** The protocol currently has no security layer. Should TLS or a custom ternary encryption scheme be integrated, or should security be handled at a different layer (e.g., WireGuard tunnels)?
-- **Streaming and backpressure:** The current message bus is push-based with bounded queues. For high-throughput scenarios, should the protocol support reactive-streams-style backpressure signaling?
-- **Compression:** Trit packing achieves ~1.585 bits per trit. Could domain-specific compression (e.g., run-length encoding for sparse ternary data) further reduce wire size?
-
-## Connection to Oxide Stack
-
-`ternary-protocol` is the universal connector:
-
-- **`ternary-channel`** — channels transport protocol messages
-- **`ternary-event`** — events are serialized as protocol payloads for cross-node delivery
-- **`ternary-command`** — commands are encoded as protocol messages for remote dispatch
-- **`ternary-blockchain`** — blocks and transactions use ternary hashing and Merkle trees
-- **`ternary-zkp`** — proof transcripts could be serialized as protocol payloads
-
-The protocol version (`0.1.0`) and capability negotiation ensure forward compatibility as the ecosystem evolves, enabling heterogeneous fleets where not all agents run the same software version.
+>>>>>>> 21dddfd (Add See Also cross-references from fleet audit)
